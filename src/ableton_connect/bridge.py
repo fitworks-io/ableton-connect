@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import html
 import json
 import os
 import re
@@ -28,10 +29,12 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from ableton_connect.tanomind import ConnectError, ConnectSession, TanomindConnect
+from ableton_connect.security import READ_ONLY_TOOLS, confirm_edit
 
 STATE_DIR = Path.home() / ".ableton-connect"
 TOKEN_PATH = STATE_DIR / "bridge-token"
 SESSION_PATH = STATE_DIR / "connect-session.json"
+REVOKED_PATH = STATE_DIR / "revoked"
 TUNNEL_URL = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 CLOUDFLARED = os.environ.get("CLOUDFLARED") or shutil.which("cloudflared") or "cloudflared"
 
@@ -46,12 +49,63 @@ class Gate:
         self.origin = "https://tanomind.com"
         self.attempt: dict[str, str] | None = None
         self._lock = asyncio.Lock()
+        self.session: ConnectSession | None = None
+        self.connect: TanomindConnect | None = None
+        self.allow_edits = False
+        self.revoked = False
+
+    def is_revoked(self) -> bool:
+        if REVOKED_PATH.exists():
+            self.revoked = True
+            self.approved = False
+        return self.revoked
+
+    def grant(self, session: ConnectSession) -> None:
+        self.session = session
+        self.agent_handle = session.agent_handle
+        # Invalidate the bootstrap credential and all previous agent credentials.
+        self.token = secrets.token_urlsafe(32)
+        self.approved = True
+
+    async def validate(self, ctx) -> bool:
+        if self.is_revoked() or not self.approved:
+            return False
+        request = getattr(ctx, "request", None)
+        if request is None or not self.allow(request.headers.get("authorization", "")):
+            return False
+        if not self.connect_required:
+            return True
+        if self.connect is None or self.session is None:
+            return False
+        try:
+            profile = await anyio.to_thread.run_sync(self.connect.profile, self.session.session_token)
+        except ConnectError:
+            self.approved = False
+            return False
+        agent = profile.get("agent") or {}
+        # Identity comes from the authenticated profile, never the join payload.
+        return bool(self.agent_handle and agent.get("handle") == self.agent_handle)
 
     def allow(self, header: str) -> bool:
+        if self.is_revoked():
+            return False
         expected = f"Bearer {self.token}"
         if len(header) != len(expected):
             return False
         return secrets.compare_digest(header, expected)
+
+
+def write_private(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    temporary = path.with_name(path.name + "." + secrets.token_hex(8))
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_token() -> str:
@@ -61,7 +115,7 @@ def load_token() -> str:
         if token:
             return token
     token = secrets.token_urlsafe(32)
-    TOKEN_PATH.write_text(token, encoding="utf-8")
+    write_private(TOKEN_PATH, token)
     return token
 
 
@@ -84,7 +138,7 @@ def load_saved_session() -> ConnectSession | None:
 
 def save_session(session: ConnectSession, expires_at: float) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    SESSION_PATH.write_text(
+    write_private(SESSION_PATH,
         json.dumps(
             {
                 "session_id": session.session_id,
@@ -93,7 +147,6 @@ def save_session(session: ConnectSession, expires_at: float) -> None:
                 "expires_at": expires_at,
             }
         ),
-        encoding="utf-8",
     )
 
 
@@ -186,14 +239,14 @@ def build_server(session: ClientSession, capabilities: Any, lock: asyncio.Lock, 
             "Call this before any Ableton tool when the user has not connected yet. "
             "Do not ask the user for a token."
         ),
-        inputSchema={"type": "object", "properties": {}},
+        input_schema={"type": "object", "properties": {}},
     )
 
     async def on_list_tools(_ctx, params):
         async with lock:
             listed = await session.list_tools(params=params)
         if gate.app_id and not gate.approved:
-            listed.tools = [connect_tool, *listed.tools]
+            listed.tools = [connect_tool]
         return listed
 
     def connect_result() -> types.CallToolResult:
@@ -207,7 +260,7 @@ def build_server(session: ClientSession, capabilities: Any, lock: asyncio.Lock, 
             if not gate.app_id:
                 return types.CallToolResult(
                     content=[types.TextContent(type="text", text="Tanomind Connect is not configured on this bridge.")],
-                    isError=True,
+                    is_error=True,
                 )
             if gate.approved:
                 who = gate.agent_handle or "the approved agent"
@@ -215,9 +268,17 @@ def build_server(session: ClientSession, capabilities: Any, lock: asyncio.Lock, 
                     content=[types.TextContent(type="text", text=f"Already connected as {who}. Ableton tools are ready.")],
                 )
             return connect_result()
-        if gate.connect_required and not gate.approved:
-            return types.CallToolResult(content=connect_result().content, isError=True)
         async with lock:
+            if not await gate.validate(_ctx):
+                return types.CallToolResult(content=[types.TextContent(type="text", text="Access denied. Use the current credential for the approved agent; reconnect if access was revoked.")], is_error=True)
+            if params.name not in READ_ONLY_TOOLS:
+                if not gate.allow_edits:
+                    return types.CallToolResult(content=[types.TextContent(type="text", text="Read-only mode: editing requires the operator to restart with --allow-edits.")], is_error=True)
+                if not await anyio.to_thread.run_sync(confirm_edit, params.name, params.arguments):
+                    return types.CallToolResult(content=[types.TextContent(type="text", text="The local operator did not approve this edit.")], is_error=True)
+                # A revocation while the operator was deciding must also win.
+                if not await gate.validate(_ctx):
+                    return types.CallToolResult(content=[types.TextContent(type="text", text="Access revoked before the edit could start.")], is_error=True)
             result = await session.call_tool(
                 params.name,
                 params.arguments,
@@ -225,7 +286,7 @@ def build_server(session: ClientSession, capabilities: Any, lock: asyncio.Lock, 
             )
         if isinstance(result, types.CallToolResult):
             return result
-        return types.CallToolResult(content=[types.TextContent(type="text", text=str(result))], isError=True)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=str(result))], is_error=True)
 
     handlers["on_list_tools"] = on_list_tools
     handlers["on_call_tool"] = on_call_tool
@@ -234,10 +295,14 @@ def build_server(session: ClientSession, capabilities: Any, lock: asyncio.Lock, 
 
         async def on_list_prompts(_ctx, params):
             async with lock:
+                if not await gate.validate(_ctx):
+                    raise PermissionError("Agent access denied")
                 return await session.list_prompts(params=params)
 
         async def on_get_prompt(_ctx, params):
             async with lock:
+                if not await gate.validate(_ctx):
+                    raise PermissionError("Agent access denied")
                 return await session.get_prompt(params.name, params.arguments)
 
         handlers["on_list_prompts"] = on_list_prompts
@@ -247,14 +312,20 @@ def build_server(session: ClientSession, capabilities: Any, lock: asyncio.Lock, 
 
         async def on_list_resources(_ctx, params):
             async with lock:
+                if not await gate.validate(_ctx):
+                    raise PermissionError("Agent access denied")
                 return await session.list_resources(params=params)
 
         async def on_list_resource_templates(_ctx, params):
             async with lock:
+                if not await gate.validate(_ctx):
+                    raise PermissionError("Agent access denied")
                 return await session.list_resource_templates(params=params)
 
         async def on_read_resource(_ctx, params):
             async with lock:
+                if not await gate.validate(_ctx):
+                    raise PermissionError("Agent access denied")
                 return await session.read_resource(str(params.uri))
 
         handlers["on_list_resources"] = on_list_resources
@@ -336,6 +407,13 @@ def grokbot_config(url: str, token: str) -> str:
     )
 
 
+def write_client_config(url: str, token: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "mcp-config.json"
+    write_private(path, grokbot_config(url, token))
+    print(f"Private MCP config saved to {path}. Share it only with the approved agent.", flush=True)
+
+
 async def restore_connect(connect: TanomindConnect, gate: Gate) -> None:
     saved = load_saved_session()
     if saved is None:
@@ -354,8 +432,9 @@ async def restore_connect(connect: TanomindConnect, gate: Gate) -> None:
         except ConnectError:
             return
     agent = profile.get("agent") if isinstance(profile.get("agent"), dict) else {}
-    gate.agent_handle = saved.agent_handle or agent.get("handle")
-    gate.approved = True
+    saved.agent_handle = agent.get("handle")
+    if saved.agent_handle:
+        gate.grant(saved)
 
 
 async def run(argv: list[str] | None = None) -> None:
@@ -364,7 +443,21 @@ async def run(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("ABLETON_CONNECT_PORT", "8765")))
     parser.add_argument("--tunnel", action="store_true", help="Publish an HTTPS URL with cloudflared.")
     parser.add_argument("--connect", action="store_true", help="Require an approved Tanomind Connect session.")
+    parser.add_argument("--allow-edits", action="store_true", help="Allow edits only after local terminal confirmation for each call.")
+    parser.add_argument("--revoke", action="store_true", help="Immediately deny new calls in the running bridge and remove its saved session.")
     args = parser.parse_args(argv)
+    if args.revoke:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        REVOKED_PATH.write_text("revoked", encoding="utf-8")
+        SESSION_PATH.unlink(missing_ok=True)
+        TOKEN_PATH.unlink(missing_ok=True)
+        (STATE_DIR / "mcp-config.json").unlink(missing_ok=True)
+        print("Access revoked. The running bridge will close its server and tunnel. Already-running calls cannot be undone.")
+        return
+    # Restart is an explicit local operator action; old credentials rotate below.
+    if REVOKED_PATH.exists():
+        SESSION_PATH.unlink(missing_ok=True)
+        REVOKED_PATH.unlink()
 
     app_id = os.environ.get("TANOME_APP_ID", "").strip()
     app_key = os.environ.get("TANOME_APP_KEY", "").strip()
@@ -375,10 +468,16 @@ async def run(argv: list[str] | None = None) -> None:
 
     public_url = os.environ.get("ABLETON_CONNECT_PUBLIC_URL", "").strip().rstrip("/") or None
     use_tunnel = args.tunnel or (connect_requested and not public_url)
-    token = os.environ.get("ABLETON_CONNECT_TOKEN", "").strip() or load_token()
+    if (use_tunnel or public_url) and not connect_requested:
+        raise SystemExit("Public access requires Tanomind Connect (--connect and app credentials).")
+    token = secrets.token_urlsafe(32) if connect_requested else (os.environ.get("ABLETON_CONNECT_TOKEN", "").strip() or load_token())
     uvx = os.environ.get("UVX_PATH") or shutil.which("uvx") or "uvx"
     gate = Gate(token, connect_required=connect_requested)
     connect = TanomindConnect(app_id, app_key, origin) if connect_requested else None
+    gate.connect = connect
+    gate.allow_edits = args.allow_edits
+    if connect_requested and not origin.startswith("https://"):
+        raise SystemExit("Tanomind Connect requires an HTTPS origin.")
 
     params = StdioServerParameters(command=uvx, args=["mcp-server-ableton-live"])
     tunnel: asyncio.subprocess.Process | None = None
@@ -408,6 +507,20 @@ async def run(argv: list[str] | None = None) -> None:
                     await restore_connect(connect, gate)
                 mcp_server = build_server(session, initialized.capabilities, lock, gate)
 
+                async def grant_access(granted: ConnectSession):
+                    assert connect is not None
+                    profile = await anyio.to_thread.run_sync(connect.profile, granted.session_token)
+                    agent = profile.get("agent") or {}
+                    handle = agent.get("handle")
+                    if not isinstance(handle, str) or not handle:
+                        raise ConnectError("Approved session has no verified agent identity")
+                    if gate.is_revoked():
+                        raise ConnectError("Access revoked during approval")
+                    granted.agent_handle = handle
+                    save_session(granted, time.time() + granted.expires_in)
+                    gate.grant(granted)
+                    write_client_config(advertised, gate.token)
+
                 async def health(_request: Request):
                     return JSONResponse(
                         {
@@ -419,7 +532,7 @@ async def run(argv: list[str] | None = None) -> None:
                     )
 
                 async def callback(request: Request):
-                    if connect is None or gate.attempt is None:
+                    if connect is None or gate.attempt is None or gate.is_revoked() or gate.approved:
                         return HTMLResponse("Connect is not waiting for approval.", status_code=400)
                     if request.query_params.get("error"):
                         return HTMLResponse("Tanomind Connect was declined.", status_code=400)
@@ -428,24 +541,29 @@ async def run(argv: list[str] | None = None) -> None:
                     expected = gate.attempt["state"]
                     if len(state) != len(expected) or not secrets.compare_digest(state, expected):
                         return HTMLResponse("This approval does not match the bridge that is running.", status_code=400)
+                    # Consume the pending state before awaiting, preventing races/replays.
+                    attempt = gate.attempt
+                    gate.attempt = None
                     try:
                         granted = await anyio.to_thread.run_sync(
-                            lambda: connect.exchange_code(code, gate.attempt["redirect_uri"], gate.attempt["verifier"])
+                            lambda: connect.exchange_code(code, attempt["redirect_uri"], attempt["verifier"])
                         )
+                        async with gate._lock:
+                            if gate.is_revoked() or gate.approved:
+                                return HTMLResponse("Access changed; restart approval.", status_code=409)
+                            await grant_access(granted)
                     except ConnectError as error:
-                        return HTMLResponse(f"Tanomind did not accept the approval ({error}).", status_code=400)
-                    save_session(granted, time.time() + granted.expires_in)
-                    gate.agent_handle = granted.agent_handle
-                    gate.approved = True
-                    gate.attempt = None
+                        return HTMLResponse("Tanomind did not accept the approval.", status_code=400)
                     who = granted.agent_handle or "your agent"
-                    return HTMLResponse(f"Connected {who} to Ableton. You can close this window.")
+                    return HTMLResponse(f"Connected {html.escape(who)} to Ableton. Ask the operator for the new private MCP config.")
 
                 async def start_connect(_request: Request):
                     if connect is None or not public_url:
                         return HTMLResponse("Tanomind Connect is not configured.", status_code=404)
                     if gate.approved:
                         return HTMLResponse("Already connected to Ableton.")
+                    if gate.is_revoked():
+                        return HTMLResponse("Access revoked. Restart the bridge locally.", status_code=403)
                     verifier, challenge = pkce()
                     state = secrets.token_urlsafe(24)
                     redirect_uri = f"{public_url}/connect/callback"
@@ -455,6 +573,8 @@ async def run(argv: list[str] | None = None) -> None:
                 async def accept_join(request: Request):
                     if connect is None or not gate.app_id or not public_url:
                         return JSONResponse({"error": "tanomind_connect_not_configured"}, status_code=404)
+                    if gate.is_revoked() or gate.approved:
+                        return JSONResponse({"error": "disconnect_existing_agent_first"}, status_code=409)
                     raw = await request.body()
                     if len(raw) > 8192:
                         return JSONResponse({"error": "invalid_join"}, status_code=400)
@@ -476,7 +596,6 @@ async def run(argv: list[str] | None = None) -> None:
                         or not verifier
                         or posted_redirect != f"{public_url}/connect/callback"
                     ):
-                        print(f"Tanomind join rejected, redirect_uri={posted_redirect!r}", flush=True)
                         return JSONResponse({"error": "invalid_join"}, status_code=400)
                     if handle is not None and (not isinstance(handle, str) or len(handle) > 80):
                         return JSONResponse({"error": "invalid_join"}, status_code=400)
@@ -484,14 +603,12 @@ async def run(argv: list[str] | None = None) -> None:
                         granted = await anyio.to_thread.run_sync(
                             lambda: connect.exchange_code(code, posted_redirect, verifier)
                         )
+                        async with gate._lock:
+                            if gate.is_revoked() or gate.approved:
+                                return JSONResponse({"error": "access_changed"}, status_code=409)
+                            await grant_access(granted)
                     except ConnectError as error:
-                        print(f"Tanomind join exchange failed: {error}", flush=True)
                         return JSONResponse({"error": "exchange_failed"}, status_code=400)
-                    if isinstance(handle, str) and handle and not granted.agent_handle:
-                        granted.agent_handle = handle
-                    save_session(granted, time.time() + granted.expires_in)
-                    gate.agent_handle = granted.agent_handle
-                    gate.approved = True
                     return JSONResponse({"ok": True})
 
                 async def connect_info(_request: Request):
@@ -516,7 +633,7 @@ async def run(argv: list[str] | None = None) -> None:
                 )
                 app = bearer_app(app, gate)
 
-                print("Grokbot MCP config:\n" + grokbot_config(advertised, token) + "\n", flush=True)
+                write_client_config(advertised, gate.token)
                 if gate.app_id and not gate.approved:
                     print(f"If you already agreed in Tanomind, open {public_url}/connect/start\n", flush=True)
                 if gate.app_id:
@@ -527,10 +644,34 @@ async def run(argv: list[str] | None = None) -> None:
                     )
                 print("Live must be open with Control Surface AbletonMCP, Input and Output set to None.\n", flush=True)
                 config = uvicorn.Config(app, host="127.0.0.1", port=args.port, log_level="warning")
-                await uvicorn.Server(config).serve()
+                http_server = uvicorn.Server(config)
+
+                async def watch_revocation():
+                    while not http_server.should_exit:
+                        if gate.is_revoked():
+                            http_server.should_exit = True
+                            if tunnel is not None and tunnel.returncode is None:
+                                tunnel.terminate()
+                            return
+                        await asyncio.sleep(0.25)
+
+                watcher = asyncio.create_task(watch_revocation())
+                try:
+                    await http_server.serve()
+                finally:
+                    watcher.cancel()
+                    try:
+                        await watcher
+                    except asyncio.CancelledError:
+                        pass
     finally:
         if tunnel is not None and tunnel.returncode is None:
             tunnel.terminate()
+            try:
+                await asyncio.wait_for(tunnel.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                tunnel.kill()
+                await tunnel.wait()
 
 
 def main(argv: list[str] | None = None) -> None:

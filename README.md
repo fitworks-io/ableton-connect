@@ -7,7 +7,7 @@ Tanomind never talks to Ableton. The bridge runs on your PC, and your agent call
 ## How it works
 
 1. The bridge starts `mcp-server-ableton-live` over stdio and serves the same tools, prompts and resources over streamable HTTP on `127.0.0.1:8765`.
-2. Every request needs `Authorization: Bearer <token>`. The token is created once and kept in `~/.ableton-connect/bridge-token`.
+2. MCP requests need `Authorization: Bearer <token>`. With Connect, approval creates a new credential for one verified agent and invalidates the bootstrap credential. The session is checked with Tanomind before each tool call.
 3. With `--tunnel`, the bridge starts `cloudflared` and prints the public `trycloudflare.com` address.
 4. With Tanomind Connect set up, Ableton calls are refused until you approve an agent. The agent asks Tanomind for a connect form, you press Agree and connect, and Tanomind sends a one-time code to the bridge. The bridge trades it for a session with PKCE and keeps the session for restarts.
 
@@ -52,10 +52,10 @@ uv run ableton-connect
 Public, for a cloud agent:
 
 ```bash
-uv run ableton-connect --tunnel
+uv run ableton-connect --connect --tunnel
 ```
 
-The bridge prints an MCP config with the URL and the bearer header:
+The bridge saves the MCP config in `~/.ableton-connect/mcp-config.json` instead of printing credentials into logs. Give the current file only to the approved agent. Approval and restarting the bridge rotate Connect credentials, so update the agent configuration afterward:
 
 ```json
 {
@@ -74,7 +74,7 @@ The bridge prints an MCP config with the URL and the bearer header:
 2. Put the app ID and key in `.env` as `TANOME_APP_ID` and `TANOME_APP_KEY`.
 3. Run `uv run ableton-connect`. With Connect set, the tunnel starts on its own unless `ABLETON_CONNECT_PUBLIC_URL` is set.
 
-On start, the bridge registers `/connect/callback` as the app's redirect URL and sets `/tanomind/join` as its agent join URL. Until an agent is approved, it adds a `connect_tanomind` tool and refuses Ableton calls with instructions to connect.
+On start, the bridge registers `/connect/callback` as the app's redirect URL and sets `/tanomind/join` as its agent join URL. Until an agent is approved, it exposes only `connect_tanomind` and refuses Ableton calls. After approval, the operator must give the approved agent its new private MCP config. A second agent cannot replace the connected agent; revoke access and restart before approving a different agent. Public access without Connect is refused.
 
 ## Settings
 
@@ -91,7 +91,30 @@ On start, the bridge registers `/connect/callback` as the app's redirect URL and
 
 ## Safety
 
-- Treat the bearer token like a password. Anyone with it and the URL can drive your Live set.
+The bridge defaults to read-only access. Only the explicit inspection tools listed in `security.py` bypass edit confirmation; unknown tools are treated as edits.
+
+To permit editing, start in an interactive local terminal:
+
+```bash
+uv run ableton-connect --connect --allow-edits
+```
+
+Every editing call displays its tool name and arguments in that terminal and requires the operator to type `APPROVE`. This includes destructive calls and prevents an agent from approving its own request. Noninteractive runs refuse edits. Save a backup of the Live set before approving changes. An approval is for one call only.
+
+To revoke the running bridge from a second terminal under the same OS account:
+
+```bash
+uv run ableton-connect --revoke
+```
+
+This denies subsequent calls, invalidates the saved session and removes the saved client configuration. Revocation is checked again after an operator confirmation. The running bridge polls for revocation every 250 ms, shuts down its HTTP server, and terminates its tunnel. It cannot undo or stop an Ableton call that has already started. Revoking the connection in Tanomind also blocks the next tool call. Tanomind outages fail closed; reconnect after access validation fails.
+
+One bridge supports one approved agent at a time. Run separate bridge instances under separate OS accounts/state directories for isolation between multiple agents. Do not share an approved agent's bearer credential: anyone possessing it can impersonate that agent. The bearer model does not prove who is using a copied credential.
+
+State files receive owner-only Unix permissions. On Windows these do not replace NTFS ACLs: keep the state directory in your private user profile and do not share it or synchronize it publicly.
+
+
+- Treat the bearer token like a password. Never put tokens or app keys in public posts, source control, or logs. Rotate a leaked token by revoking access and restarting.
 - The Ableton Remote Script listens on port 9877 with no authentication. Never expose that port. Only the bridge should face the internet.
 - Quick tunnel addresses change on every restart. A named Cloudflare tunnel keeps a fixed address.
 - Save your set first. Some Ableton tools delete tracks, replace notes or overwrite arrangement regions.
